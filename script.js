@@ -101,7 +101,18 @@ function init() {
     if (db) {
         // 接続監視
         db.ref('.info/connected').on('value', (snapshot) => {
-            console.log("Status:", snapshot.val() === true ? "Online" : "Offline");
+            const isOnline = snapshot.val() === true;
+            console.log("Sync Status:", isOnline ? "Online" : "Offline");
+            const dot = document.getElementById('sync-dot');
+            const text = document.getElementById('sync-text');
+            const statusBox = document.getElementById('sync-status');
+            if (dot && text && statusBox) {
+                dot.style.background = isOnline ? '#2ecc71' : '#ff7675';
+                text.innerText = isOnline ? 'CLOUD SYNC' : 'OFFLINE';
+                statusBox.style.color = isOnline ? '#27ae60' : '#ff7675';
+                statusBox.style.borderColor = isOnline ? '#2ecc71' : '#ff7675';
+                statusBox.style.background = isOnline ? '#f0fff4' : '#fff5f5';
+            }
         });
 
         // 作業員同期
@@ -113,7 +124,9 @@ function init() {
             // Merge cloud and local workers safely
             const workerMap = {};
             cloudWorkers.forEach(w => workerMap[w.id] = w);
-            localWorkers.forEach(w => workerMap[w.id] = w);
+            localWorkers.forEach(w => {
+                if (!workerMap[w.id]) workerMap[w.id] = w; // Cloud priority
+            });
             
             workers = Object.values(workerMap);
             
@@ -121,19 +134,27 @@ function init() {
                 workers = [{ id: 'default', name: '共通・未設定' }];
             }
             updateWorkerSelect();
+            // クラウドから得られた作業員リストを再度ローカルに保存して次回起動を速める
+            localStorage.setItem('local_workers', JSON.stringify(workers));
         });
 
         // タスク同期
         db.ref('tasks').on('value', (snapshot) => {
             const data = snapshot.val();
             let cloudTasks = data ? Object.values(data) : [];
-            let localTasks = JSON.parse(localStorage.getItem('local_tasks') || '[]');
             
             const taskMap = {};
             cloudTasks.forEach(t => taskMap[t.id] = t);
-            localTasks.forEach(t => taskMap[t.id] = t);
             
-            tasks = Object.values(taskMap);
+            // クラウドにデータがある場合はそれをマスターとする
+            if (cloudTasks.length > 0) {
+                tasks = Object.values(taskMap);
+                localStorage.setItem('local_tasks', JSON.stringify(tasks));
+            } else {
+                // クラウドが空の場合はローカルから読み込む
+                tasks = JSON.parse(localStorage.getItem('local_tasks') || '[]');
+            }
+            
             checkRecurringTasks(); 
             renderTasks();
             if (isAutoScaleEnabled) autoScale();

@@ -34,7 +34,13 @@
             <div id="system-message" class="system-message-card" style="position: relative; display: flex; align-items: center; gap: 20px;">
                 <div class="worker-selector-wrapper" style="display: flex; align-items: flex-end; gap: 8px;">
                     <div style="flex: 1;">
-                        <label style="font-size: 0.8rem; font-weight: 900; display: block; margin-bottom: 5px;">現在の作業者</label>
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;">
+                            <label style="font-size: 0.8rem; font-weight: 900;">現在の作業者</label>
+                            <div id="sync-status" title="同期ステータス" style="display: flex; align-items: center; gap: 4px; font-size: 0.6rem; font-weight: 900; color: #ff7675; background: #fff5f5; padding: 2px 8px; border-radius: 10px; border: 1px solid #ff7675;">
+                                <span id="sync-dot" style="width: 6px; height: 6px; background: #ff7675; border-radius: 50%;"></span>
+                                <span id="sync-text">OFFLINE</span>
+                            </div>
+                        </div>
                         <select id="worker-select" onchange="handleWorkerChange()" style="padding: 8px 15px; border: 3px solid var(--text-main); border-radius: 12px; font-weight: 900; background: white; cursor: pointer; min-width: 150px; width: 100%;">
                             <!-- Workers will be populated here -->
                         </select>
