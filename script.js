@@ -5,6 +5,7 @@ const firebaseConfig = {
   apiKey: "AIzaSyBfe7X9WcpCiTPf6nzJaZRXxGLwQRKALqs",
   authDomain: "factory-kanban.firebaseapp.com",
   projectId: "factory-kanban",
+  databaseURL: "https://factory-kanban-default-rtdb.firebaseio.com",
   storageBucket: "factory-kanban.firebasestorage.app",
   messagingSenderId: "7390637548",
   appId: "1:7390637548:web:909d565531d2f1d3d924c9"
@@ -26,9 +27,11 @@ try {
         console.log("Firebase initialized successfully.");
     } else {
         console.warn("Firebase SDK not found. Running in offline mode.");
+        alert("Firebase SDKの読み込みに失敗しました。広告ブロック等が有効な場合はオフにしてください。");
     }
 } catch (e) {
     console.error("Firebase initialization error:", e);
+    alert("Firebase接続設定エラー: " + e.message);
 }
 
 // DOM Elements
