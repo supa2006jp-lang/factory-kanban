@@ -5,7 +5,7 @@ const firebaseConfig = {
   apiKey: "AIzaSyBfe7X9WcpCiTPf6nzJaZRXxGLwQRKALqs",
   authDomain: "factory-kanban.firebaseapp.com",
   projectId: "factory-kanban",
-  databaseURL: "https://factory-kanban-default-rtdb.firebaseio.com",
+  databaseURL: "https://factory-kanban-default-rtdb.asia-southeast1.firebasedatabase.app",
   storageBucket: "factory-kanban.firebasestorage.app",
   messagingSenderId: "7390637548",
   appId: "1:7390637548:web:909d565531d2f1d3d924c9"
@@ -24,14 +24,15 @@ try {
     if (typeof firebase !== 'undefined') {
         firebase.initializeApp(firebaseConfig);
         db = firebase.database();
-        console.log("Firebase initialized successfully.");
+        console.log("Firebase initialized.");
     } else {
-        console.warn("Firebase SDK not found. Running in offline mode.");
-        alert("Firebase SDKの読み込みに失敗しました。広告ブロック等が有効な場合はオフにしてください。");
+        throw new Error("Firebase SDKが読み込まれていません。広告ブロック等を確認してください。");
     }
 } catch (e) {
-    console.error("Firebase initialization error:", e);
-    alert("Firebase接続設定エラー: " + e.message);
+    console.error("Critical Error:", e);
+    setTimeout(() => {
+        alert("【システムエラー】クラウド接続失敗: " + e.message);
+    }, 1000);
 }
 
 // DOM Elements
