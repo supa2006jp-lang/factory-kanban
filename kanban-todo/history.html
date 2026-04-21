@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>【デバッグ版】タスク履歴確認</title>
+    <link rel="stylesheet" href="style.css">
+    <style>
+        .debug-panel {
+            background: #ffeaa7;
+            border: 3px solid #2d3436;
+            padding: 20px;
+            border-radius: 20px;
+            margin-bottom: 30px;
+            box-shadow: 8px 8px 0 #2d3436;
+        }
+    </style>
+</head>
+<body style="background: #fdf6e3; padding: 40px;">
+    <div style="max-width: 800px; margin: 0 auto;">
+        <a href="index.html" class="add-task-header-btn" style="text-decoration: none; display: inline-block; margin-bottom: 20px;">← ボードに戻る</a>
+        
+        <div class="debug-panel">
+            <h2 style="font-weight: 900; margin-bottom: 10px;">🔍 デバッグ情報</h2>
+            <p>保存されている全タスク数: <strong id="debug-count">確認中...</strong></p>
+            <p>最終読み込み時刻: <span id="debug-time"></span></p>
+            <button onclick="localStorage.clear(); location.reload();" style="background: #ff7675; color: white; border: 2px solid #2d3436; padding: 5px 10px; border-radius: 10px; cursor: pointer; font-weight: 800; margin-top: 10px;">強制リセット（全てのデータを消す）</button>
+        </div>
+
+        <h1 style="font-weight: 900; font-size: 2rem; margin-bottom: 20px;">全データ一覧（無条件表示）</h1>
+        <div id="full-list" class="history-list">
+            <!-- Loading... -->
+        </div>
+
+        <div style="margin-top: 50px;">
+            <h3 style="font-weight: 800;">生の保存データ (JSON):</h3>
+            <pre id="raw-json" style="background: #eee; padding: 20px; border-radius: 10px; overflow-x: auto; font-size: 0.8rem;"></pre>
+        </div>
+    </div>
+
+    <script>
+        function renderAll() {
+            const listEl = document.getElementById('full-list');
+            const countEl = document.getElementById('debug-count');
+            const timeEl = document.getElementById('debug-time');
+            const rawEl = document.getElementById('raw-json');
+            
+            timeEl.textContent = new Date().toLocaleTimeString();
+            
+            const rawData = localStorage.getItem('kanban-tasks');
+            rawEl.textContent = rawData || 'データが空です (null OR undefined)';
+            
+            const tasks = JSON.parse(rawData) || [];
+            countEl.textContent = tasks.length + ' 件';
+
+            listEl.innerHTML = '';
+            if (tasks.length === 0) {
+                listEl.innerHTML = '<p style="font-size: 1.2rem; font-weight: 800; color: #636e72;">表示できるデータがありません。</p>';
+                return;
+            }
+
+            tasks.forEach(task => {
+                const item = document.createElement('div');
+                item.className = 'history-item';
+                item.style.marginBottom = '20px';
+                item.style.background = 'white';
+                item.style.border = '3px solid #2d3436';
+                item.style.padding = '20px';
+                item.style.borderRadius = '20px';
+                item.style.boxShadow = '6px 6px 0 #2d3436';
+                
+                item.innerHTML = `
+                    <div style="font-weight: 900; font-size: 1.2rem;">内容: ${task.content || 'なし'}</div>
+                    <div style="font-size: 0.9rem; color: #636e72; margin-top: 10px;">
+                        ステータス: <strong>${task.status}</strong> | 
+                        ID: ${task.id} | 
+                        完了時刻: ${task.completedAt ? new Date(task.completedAt).toLocaleString() : 'なし'} |
+                        アーカイブ: ${task.archived ? 'はい' : 'いいえ'}
+                    </div>
+                `;
+                listEl.appendChild(item);
+            });
+        }
+
+        document.addEventListener('DOMContentLoaded', renderAll);
+    </script>
+</body>
+</html>
