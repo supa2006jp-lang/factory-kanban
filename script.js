@@ -128,8 +128,16 @@ function init() {
             // Merge cloud and local workers safely
             const workerMap = {};
             cloudWorkers.forEach(w => workerMap[w.id] = w);
+            
+            let hasUnsynced = false;
             localWorkers.forEach(w => {
-                if (!workerMap[w.id]) workerMap[w.id] = w; // Cloud priority
+                if (!workerMap[w.id]) {
+                    workerMap[w.id] = w; // Add to local state
+                    if (w.id !== 'default') {
+                        // Push missing workers to cloud
+                        db.ref('workers/' + w.id).set(w).catch(console.warn);
+                    }
+                }
             });
             
             workers = Object.values(workerMap);
@@ -138,7 +146,6 @@ function init() {
                 workers = [{ id: 'default', name: '共通・未設定' }];
             }
             updateWorkerSelect();
-            // クラウドから得られた作業員リストを再度ローカルに保存して次回起動を速める
             localStorage.setItem('local_workers', JSON.stringify(workers));
         });
 
@@ -146,18 +153,21 @@ function init() {
         db.ref('tasks').on('value', (snapshot) => {
             const data = snapshot.val();
             let cloudTasks = data ? Object.values(data) : [];
+            let localTasks = JSON.parse(localStorage.getItem('local_tasks') || '[]');
             
             const taskMap = {};
             cloudTasks.forEach(t => taskMap[t.id] = t);
-            
-            // クラウドにデータがある場合はそれをマスターとする
-            if (cloudTasks.length > 0) {
-                tasks = Object.values(taskMap);
-                localStorage.setItem('local_tasks', JSON.stringify(tasks));
-            } else {
-                // クラウドが空の場合はローカルから読み込む
-                tasks = JSON.parse(localStorage.getItem('local_tasks') || '[]');
-            }
+
+            // ローカルにしか無いタスクがあればクラウドにアップロード（同期漏れ救済）
+            localTasks.forEach(t => {
+                if (!taskMap[t.id]) {
+                    taskMap[t.id] = t;
+                    db.ref('tasks/' + t.id).set(t).catch(console.warn);
+                }
+            });
+
+            tasks = Object.values(taskMap);
+            localStorage.setItem('local_tasks', JSON.stringify(tasks));
             
             checkRecurringTasks(); 
             renderTasks();
