@@ -23,7 +23,6 @@
             <h2 style="font-weight: 900; margin-bottom: 10px;">🔍 デバッグ情報</h2>
             <p>保存されている全タスク数: <strong id="debug-count">確認中...</strong></p>
             <p>最終読み込み時刻: <span id="debug-time"></span></p>
-            <button onclick="localStorage.clear(); location.reload();" style="background: #ff7675; color: white; border: 2px solid #2d3436; padding: 5px 10px; border-radius: 10px; cursor: pointer; font-weight: 800; margin-top: 10px;">強制リセット（全てのデータを消す）</button>
         </div>
 
         <h1 style="font-weight: 900; font-size: 2rem; margin-bottom: 20px;">全データ一覧（無条件表示）</h1>
@@ -31,13 +30,23 @@
             <!-- Loading... -->
         </div>
 
-        <div style="margin-top: 50px;">
-            <h3 style="font-weight: 800;">生の保存データ (JSON):</h3>
+        <details style="margin-top: 50px;">
+            <summary style="font-weight: 800; cursor: pointer;">保存データを確認する（JSON）</summary>
             <pre id="raw-json" style="background: #eee; padding: 20px; border-radius: 10px; overflow-x: auto; font-size: 0.8rem;"></pre>
-        </div>
+        </details>
     </div>
 
     <script>
+        function escapeHTML(value) {
+            return String(value || '').replace(/[&<>"']/g, char => ({
+                '&': '&amp;',
+                '<': '&lt;',
+                '>': '&gt;',
+                '"': '&quot;',
+                "'": '&#39;'
+            }[char]));
+        }
+
         function renderAll() {
             const listEl = document.getElementById('full-list');
             const countEl = document.getElementById('debug-count');
@@ -46,10 +55,18 @@
             
             timeEl.textContent = new Date().toLocaleTimeString();
             
-            const rawData = localStorage.getItem('kanban-tasks');
+            const rawData = localStorage.getItem('local_tasks');
             rawEl.textContent = rawData || 'データが空です (null OR undefined)';
             
-            const tasks = JSON.parse(rawData) || [];
+            let tasks = [];
+            try {
+                const parsed = rawData ? JSON.parse(rawData) : [];
+                tasks = Array.isArray(parsed) ? parsed : [];
+            } catch (error) {
+                countEl.textContent = '読み込み失敗';
+                listEl.innerHTML = '<p style="font-size: 1.2rem; font-weight: 800; color: #d63031;">保存データの形式が壊れているため、履歴を表示できません。</p>';
+                return;
+            }
             countEl.textContent = tasks.length + ' 件';
 
             listEl.innerHTML = '';
@@ -69,12 +86,12 @@
                 item.style.boxShadow = '6px 6px 0 #2d3436';
                 
                 item.innerHTML = `
-                    <div style="font-weight: 900; font-size: 1.2rem;">内容: ${task.content || 'なし'}</div>
+                    <div style="font-weight: 900; font-size: 1.2rem;">内容: ${escapeHTML(task.title || task.content || 'なし')}</div>
                     <div style="font-size: 0.9rem; color: #636e72; margin-top: 10px;">
-                        ステータス: <strong>${task.status}</strong> | 
-                        ID: ${task.id} | 
-                        完了時刻: ${task.completedAt ? new Date(task.completedAt).toLocaleString() : 'なし'} |
-                        アーカイブ: ${task.archived ? 'はい' : 'いいえ'}
+                        ステータス: <strong>${escapeHTML(task.status || 'なし')}</strong> | 
+                        ID: ${escapeHTML(task.id || 'なし')} | 
+                        更新: ${task.updatedAt ? new Date(task.updatedAt).toLocaleString() : 'なし'} |
+                        詳細: ${task.description ? 'あり' : 'なし'}
                     </div>
                 `;
                 listEl.appendChild(item);

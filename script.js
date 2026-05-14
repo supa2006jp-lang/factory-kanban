@@ -18,6 +18,9 @@ let currentWorkerId = localStorage.getItem('current-worker-id') || 'default';
 let currentTargetColumn = 'todo';
 let isAutoScaleEnabled = false;
 let db = null; // データベース用変数を初期化
+let draftSaveTimer = null;
+let activeDraftKey = '';
+let isRestoringDraft = false;
 
 // Firebase 初期化
 try {
@@ -83,6 +86,8 @@ window.handleAuth = function() {
 // 2. 初期化・同期
 // ==========================================
 function init() {
+    disableSpellcheck();
+
     lists = {
         todo: document.getElementById('list-todo'),
         progress: document.getElementById('list-progress'),
@@ -98,7 +103,7 @@ function init() {
     let loadedWorkers = JSON.parse(localStorage.getItem('local_workers') || '[{"id":"default","name":"共通・未設定"}]');
     if (loadedWorkers.length === 0) loadedWorkers = [{"id":"default","name":"共通・未設定"}];
     workers = loadedWorkers;
-    tasks = JSON.parse(localStorage.getItem('local_tasks') || '[]');
+    tasks = readLocalTasks();
     updateWorkerSelect();
     renderTasks();
 
@@ -153,7 +158,7 @@ function init() {
         db.ref('tasks').on('value', (snapshot) => {
             const data = snapshot.val();
             let cloudTasks = data ? Object.values(data) : [];
-            let localTasks = JSON.parse(localStorage.getItem('local_tasks') || '[]');
+            let localTasks = readLocalTasks();
             
             const taskMap = {};
             cloudTasks.forEach(t => taskMap[t.id] = t);
@@ -167,7 +172,7 @@ function init() {
             });
 
             tasks = Object.values(taskMap);
-            localStorage.setItem('local_tasks', JSON.stringify(tasks));
+            saveLocalTasks(tasks);
             
             checkRecurringTasks(); 
             renderTasks();
@@ -329,7 +334,8 @@ function renderTasks() {
 
 function createTaskCard(task) {
     const card = document.createElement('div');
-    card.className = `task-card priority-${task.priority || 'low'} ${task.isRecurring ? 'type-recurring' : ''} ${task.isRequest ? 'type-request' : ''}`;
+    const deadlineStatus = getDeadlineStatus(task);
+    card.className = `task-card priority-${task.priority || 'low'} ${task.isRecurring ? 'type-recurring' : ''} ${task.isRequest ? 'type-request' : ''} ${deadlineStatus ? `deadline-${deadlineStatus}` : ''}`;
     card.draggable = true;
     card.dataset.id = task.id;
     card.addEventListener('dragstart', handleDragStart);
@@ -346,7 +352,8 @@ function createTaskCard(task) {
         const month = parseInt(dateParts[1], 10);
         const day = parseInt(dateParts[2], 10);
 
-        deadlineInfo = `<div class="task-deadline" style="display:inline-block; margin-top:8px; padding:3px 10px; border-radius:8px; font-size:0.75rem; font-weight:900; background-color:#ffeb3b; color:#d32f2f; border:2px solid #d32f2f; box-shadow: 2px 2px 0px rgba(0,0,0,0.2);">
+        const deadlineLabel = deadlineStatus === 'overdue' ? '期限切れ' : deadlineStatus === 'today' ? '今日' : deadlineStatus === 'tomorrow' ? '明日' : '期限';
+        deadlineInfo = `<div class="task-deadline task-deadline-${deadlineStatus || 'normal'}">
             ⏰ 期限: ${month}/${day}${timeStr}
         </div>`;
     }
@@ -366,13 +373,27 @@ function createTaskCard(task) {
         `;
     }
     
+    const hasDetail = hasTaskDetail(task);
+    const checkCount = countDetailCheckmarks(task.description || '');
+    const checkBadgeHTML = checkCount > 0 ? `<div class="task-check-count">✅ ${checkCount}</div>` : '';
+    const updatedHTML = task.updatedAt ? `<div class="task-updated-at">更新 ${escapeHTML(formatCardUpdatedAt(task.updatedAt))}</div>` : '';
     const archiveBtnHTML = task.status === 'done' ? `<div style="position:absolute; right:15px; top:50%; transform:translateY(-50%); font-size:1.5rem; cursor:pointer;" onclick="archiveTask(event, '${task.id}')" title="履歴に格納">🗑️</div>` : '';
+    const detailPreviewHTML = hasDetail ? `
+        <button type="button" class="detail-preview-trigger" title="具体的詳細を表示"
+            onclick="event.stopPropagation()"
+            onmouseenter="showTaskDetailPreview(event, '${escapeJSString(task.id)}')">
+            💬
+        </button>
+    ` : '';
 
     card.innerHTML = `
+        ${detailPreviewHTML}
         ${requestStamp}
         <div class="task-content">
-            <div style="font-weight:900; padding-right:30px;">${escapeHTML(task.title || task.content)}</div>
+            <div style="font-weight:900; padding-right:48px;">${escapeHTML(task.title || task.content)}</div>
             ${deadlineInfo}
+            ${checkBadgeHTML}
+            ${updatedHTML}
         </div>
         ${archiveBtnHTML}
     `;
@@ -389,6 +410,7 @@ window.openModal = function(status, taskId = null, isRecurring = false, isReques
     const rejectBtn = document.getElementById('reject-btn');
     
     resetModal();
+    activeDraftKey = getDraftKey(taskId || 'new');
     
     if (taskId) {
         const task = tasks.find(t => t.id === taskId);
@@ -437,6 +459,8 @@ window.openModal = function(status, taskId = null, isRecurring = false, isReques
             renderWorkerCheckboxes([currentWorkerId]);
         }
     }
+    restoreDraftIfNeeded();
+    setupDraftAutosave();
     modal.classList.add('active');
 };
 
@@ -459,7 +483,9 @@ function renderWorkerCheckboxes(selectedIds) {
 }
 
 window.saveTask = function() {
-    const id = document.getElementById('edit-task-id').value || Date.now().toString();
+    const editTaskId = document.getElementById('edit-task-id').value;
+    const isNew = !editTaskId;
+    const id = editTaskId || Date.now().toString();
     const title = document.getElementById('task-title').value;
     if (!title) { alert('タイトルを入力してください。'); return; }
     
@@ -472,8 +498,13 @@ window.saveTask = function() {
     const dateVal = document.getElementById('task-deadline-date').value;
     const timeVal = document.getElementById('task-deadline-time').value;
     const finalDeadline = dateVal ? (timeVal ? `${dateVal}T${timeVal}` : dateVal) : '';
+    const existingTask = tasks.find(t => t.id === id);
+    const editHistory = existingTask && Array.isArray(existingTask.editHistory) ? [...existingTask.editHistory] : [];
+    const editLabel = `${formatDetailTimestamp()} ${existingTask ? '編集' : '作成'}`;
+    editHistory.unshift(editLabel);
 
     const newTask = {
+        ...(existingTask || {}),
         id, title,
         description: document.getElementById('task-desc').value,
         priority: document.getElementById('task-priority').value,
@@ -483,20 +514,12 @@ window.saveTask = function() {
         isRequest,
         assignedTo: isRequest ? selectedWorkers : [currentWorkerId],
         requestedBy: isRequest ? currentWorkerId : null,
-        requestGroupId: isRequest ? (id + '-group') : null
+        requestGroupId: isRequest ? (id + '-group') : null,
+        editHistory: editHistory.slice(0, 20),
+        updatedAt: new Date().toISOString()
     };
 
-    // 最優先でローカルを更新（オフライン・保留時対策）
-    let localTasks = JSON.parse(localStorage.getItem('local_tasks') || '[]');
-    const existingIdx = localTasks.findIndex(t => t.id === id);
-    if (existingIdx >= 0) localTasks[existingIdx] = newTask;
-    else localTasks.push(newTask);
-    localStorage.setItem('local_tasks', JSON.stringify(localTasks));
-
-    const isNew = !document.getElementById('edit-task-id').value;
-    const memIdx = tasks.findIndex(t => t.id === id);
-    if (memIdx >= 0) tasks[memIdx] = newTask;
-    else tasks.push(newTask);
+    upsertTaskLocally(newTask);
     
     // --- ログ登録（オフライン対応） ---
     if (isRequest && isNew) {
@@ -522,15 +545,13 @@ window.saveTask = function() {
     if (db) {
         db.ref('tasks/' + id).set(newTask).catch(console.warn);
     }
+    clearDraft(getDraftKey(id));
+    if (activeDraftKey) clearDraft(activeDraftKey);
 };
 
 window.deleteTask = function(id) {
     if (confirm('このタスクを削除しますか？')) {
-        let localTasks = JSON.parse(localStorage.getItem('local_tasks') || '[]');
-        localTasks = localTasks.filter(t => t.id !== id);
-        localStorage.setItem('local_tasks', JSON.stringify(localTasks));
-        
-        tasks = tasks.filter(t => t.id !== id);
+        removeTaskLocally(id);
         renderTasks();
 
         if (db) {
@@ -555,7 +576,8 @@ window.rejectTask = function() {
 
     if (confirm(`この依頼「${title}」を拒否しますか？`)) {
         const timeStr = new Date().toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' });
-        const logText = `依頼拒否 ［${title} by ${currentWorkerId}］`;
+        const workerName = getWorkerName(currentWorkerId);
+        const logText = `依頼拒否 ［${title} by ${workerName}］`;
         
         // 自分自身（拒否操作をした本人）のログに表示
         appendLog(currentWorkerId, logText, timeStr);
@@ -575,10 +597,7 @@ window.rejectTask = function() {
             task.rejectedBy.push(currentWorkerId);
         }
         
-        let localTasks = JSON.parse(localStorage.getItem('local_tasks') || '[]');
-        const idx = localTasks.findIndex(t => t.id === id);
-        if (idx >= 0) localTasks[idx] = task;
-        localStorage.setItem('local_tasks', JSON.stringify(localTasks));
+        upsertTaskLocally(task);
 
         renderTasks();
         renderLogs();
@@ -597,14 +616,7 @@ window.moveTask = function(id, newStatus) {
     const oldStatus = task.status;
     task.status = newStatus;
 
-    let localTasks = JSON.parse(localStorage.getItem('local_tasks') || '[]');
-    const lTask = localTasks.find(t => t.id === id);
-    if (lTask) {
-        lTask.status = newStatus;
-    } else {
-        localTasks.push(task);
-    }
-    localStorage.setItem('local_tasks', JSON.stringify(localTasks));
+    upsertTaskLocally(task);
 
     // --- ログ通知の生成 ---
     if (task.isRequest && task.requestedBy && oldStatus !== newStatus) {
@@ -613,9 +625,9 @@ window.moveTask = function(id, newStatus) {
         let logText = '';
         
         if (newStatus === 'progress' && oldStatus === 'todo') {
-            logText = `依頼着手 ［${title} by ${currentWorkerId}］`;
+            logText = `依頼着手 ［${title} by ${getWorkerName(currentWorkerId)}］`;
         } else if (newStatus === 'done' && oldStatus !== 'done') {
-            logText = `依頼完了 ［${title} by ${currentWorkerId}］`;
+            logText = `依頼完了 ［${title} by ${getWorkerName(currentWorkerId)}］`;
         }
         
         if (logText) {
@@ -740,6 +752,264 @@ function escapeHTML(str) {
     return str.replace(/[&<>"']/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m]));
 }
 
+function escapeJSString(str) {
+    return String(str || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+}
+
+function getDeadlineStatus(task) {
+    if (!task || !task.deadline || task.status === 'done' || task.status === 'archived') return '';
+    const deadline = new Date(task.deadline.includes('T') ? task.deadline : `${task.deadline}T23:59`);
+    if (Number.isNaN(deadline.getTime())) return '';
+
+    const now = new Date();
+    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const tomorrowStart = new Date(todayStart);
+    tomorrowStart.setDate(tomorrowStart.getDate() + 1);
+    const dayAfterTomorrowStart = new Date(todayStart);
+    dayAfterTomorrowStart.setDate(dayAfterTomorrowStart.getDate() + 2);
+
+    if (deadline < now) return 'overdue';
+    if (deadline >= todayStart && deadline < tomorrowStart) return 'today';
+    if (deadline >= tomorrowStart && deadline < dayAfterTomorrowStart) return 'tomorrow';
+    return '';
+}
+
+function getWorkerName(workerId) {
+    const worker = workers.find(w => w.id === workerId);
+    return worker ? worker.name : workerId;
+}
+
+function readLocalTasks() {
+    try {
+        const saved = JSON.parse(localStorage.getItem('local_tasks') || '[]');
+        return Array.isArray(saved) ? saved : [];
+    } catch (error) {
+        console.warn('local_tasks の読み込みに失敗しました。', error);
+        return [];
+    }
+}
+
+function saveLocalTasks(nextTasks) {
+    localStorage.setItem('local_tasks', JSON.stringify(nextTasks));
+}
+
+function upsertTaskLocally(task) {
+    const localTasks = readLocalTasks();
+    const localIndex = localTasks.findIndex(t => t.id === task.id);
+    if (localIndex >= 0) localTasks[localIndex] = task;
+    else localTasks.push(task);
+    saveLocalTasks(localTasks);
+
+    const memIndex = tasks.findIndex(t => t.id === task.id);
+    if (memIndex >= 0) tasks[memIndex] = task;
+    else tasks.push(task);
+}
+
+function removeTaskLocally(id) {
+    saveLocalTasks(readLocalTasks().filter(t => t.id !== id));
+    tasks = tasks.filter(t => t.id !== id);
+}
+
+const DETAIL_CHECK_MARK = '✅';
+
+function hasTaskDetail(task) {
+    return Boolean(task && task.description && task.description.trim());
+}
+
+function countDetailCheckmarks(detail) {
+    return (detail.match(new RegExp(DETAIL_CHECK_MARK, 'g')) || []).length;
+}
+
+function isDetailSeparatorLine(line) {
+    return /^-{8,}$/.test(line.trim());
+}
+
+function escapeRegExp(str) {
+    return String(str || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function highlightSearchText(escapedText, query) {
+    if (!query) return escapedText;
+    const escapedQuery = escapeHTML(query);
+    if (!escapedQuery) return escapedText;
+    return escapedText.replace(new RegExp(escapeRegExp(escapedQuery), 'gi'), match => `<mark class="detail-search-hit">${match}</mark>`);
+}
+
+function renderInlineDetailText(text, query = '') {
+    return text.split(DETAIL_CHECK_MARK).map((part, index) => {
+        const renderedPart = highlightSearchText(escapeHTML(part), query);
+        if (index === 0) return renderedPart;
+        return `<span class="detail-render-check">${DETAIL_CHECK_MARK}</span>${renderedPart}`;
+    }).join('');
+}
+
+function renderDetailCheckToggle(line, lineIndex) {
+    const isChecked = line.includes(DETAIL_CHECK_MARK);
+    return `
+        <button type="button"
+            class="detail-line-check-toggle ${isChecked ? 'checked' : ''}"
+            title="${isChecked ? 'チェックを外す' : 'チェックする'}"
+            onclick="toggleDetailLineCheck(event, ${lineIndex})">
+            ${isChecked ? DETAIL_CHECK_MARK : '□'}
+        </button>
+    `;
+}
+
+function getTimestampFromLine(line) {
+    const match = line.match(/【(\d{1,2}\/\d{1,2} \d{2}:\d{2})】\s*$/);
+    if (!match) return null;
+    return {
+        stamp: match[1],
+        text: line.slice(0, match.index).trimEnd()
+    };
+}
+
+function renderTaskDetailHTML(detail, query = '') {
+    if (!detail || !detail.trim()) {
+        return '<div class="detail-render-empty">具体的詳細はまだありません。</div>';
+    }
+
+    return detail.split(/\r?\n/).map((line, lineIndex) => {
+        if (isDetailSeparatorLine(line)) {
+            return '<hr class="detail-render-separator">';
+        }
+        const timestampInfo = getTimestampFromLine(line);
+        if (timestampInfo) {
+            const renderedText = timestampInfo.text
+                ? renderInlineDetailText(timestampInfo.text, query)
+                : '';
+            const doneClass = timestampInfo.text.includes(DETAIL_CHECK_MARK) ? ' detail-render-done-line' : '';
+            return `
+                <div class="detail-render-line detail-render-line-with-timestamp${doneClass}">
+                    ${renderDetailCheckToggle(line, lineIndex)}
+                    <span class="detail-render-line-text">${renderedText}</span>
+                    <span class="detail-render-timestamp">${escapeHTML(timestampInfo.stamp)}</span>
+                </div>
+            `;
+        }
+        if (!line.trim()) {
+            return '<div class="detail-render-blank"></div>';
+        }
+        const doneClass = line.includes(DETAIL_CHECK_MARK) ? ' detail-render-done-line' : '';
+        return `
+            <div class="detail-render-line${doneClass}">
+                ${renderDetailCheckToggle(line, lineIndex)}
+                <span class="detail-render-line-text">${renderInlineDetailText(line, query)}</span>
+            </div>
+        `;
+    }).join('');
+}
+
+function renderVisibleTaskDetailHTML(detail, query = '', hideDone = false) {
+    if (!hideDone) return renderTaskDetailHTML(detail, query);
+    const filtered = (detail || '').split(/\r?\n/).filter(line => !line.includes(DETAIL_CHECK_MARK)).join('\n');
+    return renderTaskDetailHTML(filtered, query);
+}
+
+function formatDetailTimestamp(date = new Date()) {
+    const month = date.getMonth() + 1;
+    const day = date.getDate();
+    const hours = String(date.getHours()).padStart(2, '0');
+    const minutes = String(date.getMinutes()).padStart(2, '0');
+    return `${month}/${day} ${hours}:${minutes}`;
+}
+
+function formatCardUpdatedAt(value) {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return '';
+    return formatDetailTimestamp(date);
+}
+
+function getDraftKey(id) {
+    return `task-draft-${id || 'new'}`;
+}
+
+function collectDraftData() {
+    return {
+        title: document.getElementById('task-title').value,
+        description: document.getElementById('task-desc').value,
+        priority: document.getElementById('task-priority').value,
+        deadlineDate: document.getElementById('task-deadline-date').value,
+        deadlineTime: document.getElementById('task-deadline-time').value,
+        recurring: document.getElementById('task-recurring').checked,
+        savedAt: new Date().toISOString()
+    };
+}
+
+function applyDraftData(draft) {
+    if (!draft) return;
+    isRestoringDraft = true;
+    document.getElementById('task-title').value = draft.title || '';
+    document.getElementById('task-desc').value = draft.description || '';
+    document.getElementById('task-priority').value = draft.priority || 'low';
+    document.getElementById('task-deadline-date').value = draft.deadlineDate || '';
+    document.getElementById('task-deadline-time').value = draft.deadlineTime || '';
+    document.getElementById('task-recurring').checked = Boolean(draft.recurring);
+    isRestoringDraft = false;
+}
+
+function saveDraftNow() {
+    if (!activeDraftKey || isRestoringDraft) return;
+    const draft = collectDraftData();
+    if (!draft.title && !draft.description && !draft.deadlineDate && !draft.deadlineTime) return;
+    localStorage.setItem(activeDraftKey, JSON.stringify(draft));
+}
+
+function scheduleDraftSave() {
+    if (isRestoringDraft) return;
+    clearTimeout(draftSaveTimer);
+    draftSaveTimer = setTimeout(saveDraftNow, 800);
+}
+
+function setupDraftAutosave() {
+    ['task-title', 'task-desc', 'task-priority', 'task-deadline-date', 'task-deadline-time', 'task-recurring'].forEach(id => {
+        const el = document.getElementById(id);
+        if (!el || el.dataset.draftAutosave === 'true') return;
+        el.addEventListener('input', scheduleDraftSave);
+        el.addEventListener('change', scheduleDraftSave);
+        el.dataset.draftAutosave = 'true';
+    });
+}
+
+function restoreDraftIfNeeded() {
+    if (!activeDraftKey) return;
+    const raw = localStorage.getItem(activeDraftKey);
+    if (!raw) return;
+    try {
+        const draft = JSON.parse(raw);
+        const stamp = draft.savedAt ? formatCardUpdatedAt(draft.savedAt) : '';
+        if (confirm(`未保存の下書きがあります。復元しますか？${stamp ? `\n保存時刻: ${stamp}` : ''}`)) {
+            applyDraftData(draft);
+        }
+    } catch (e) {
+        localStorage.removeItem(activeDraftKey);
+    }
+}
+
+function clearDraft(key) {
+    if (key) localStorage.removeItem(key);
+}
+
+function measureTextareaText(textarea, text) {
+    const canvas = measureTextareaText.canvas || (measureTextareaText.canvas = document.createElement('canvas'));
+    const context = canvas.getContext('2d');
+    const style = window.getComputedStyle(textarea);
+    context.font = `${style.fontStyle} ${style.fontVariant} ${style.fontWeight} ${style.fontSize} / ${style.lineHeight} ${style.fontFamily}`;
+    return context.measureText(text).width;
+}
+
+function buildRightAlignedTimestampLine(textarea, lineText, timestamp) {
+    const cleanLine = lineText.replace(/\s*【\d{1,2}\/\d{1,2} \d{2}:\d{2}】\s*$/, '').trimEnd();
+    const stampText = `【${timestamp}】`;
+    return cleanLine ? `${cleanLine} ${stampText}` : stampText;
+}
+
+function disableSpellcheck() {
+    document.querySelectorAll('input[type="text"], textarea').forEach(el => {
+        el.setAttribute('spellcheck', 'false');
+    });
+}
+
 function resetModal() {
     document.getElementById('edit-task-id').value = '';
     document.getElementById('task-title').value = '';
@@ -752,9 +1022,298 @@ function resetModal() {
     document.getElementById('reject-btn').style.display = 'none';
     const delBtn = document.getElementById('modal-delete-btn');
     if (delBtn) delBtn.style.display = 'none';
+    setTaskDetailFullscreen(true);
 }
 
+function setTaskDetailFullscreen(isFullscreen) {
+    const content = document.getElementById('task-modal-content');
+    const btn = document.getElementById('detail-fullscreen-btn');
+    if (!content) return;
+
+    content.classList.toggle('detail-fullscreen', isFullscreen);
+    if (btn) {
+        btn.textContent = isFullscreen ? 'ミニ' : '全画面';
+        btn.style.background = isFullscreen ? 'white' : '#e7f3ff';
+    }
+}
+
+window.toggleTaskDetailFullscreen = function() {
+    const content = document.getElementById('task-modal-content');
+    if (!content) return;
+    setTaskDetailFullscreen(!content.classList.contains('detail-fullscreen'));
+};
+
+window.insertDetailSeparator = function() {
+    const textarea = document.getElementById('task-desc');
+    if (!textarea) return;
+
+    const textStyle = window.getComputedStyle(textarea);
+    const fontSize = parseFloat(textStyle.fontSize) || 16;
+    const approxCharWidth = fontSize * 0.62;
+    const horizontalPadding = (parseFloat(textStyle.paddingLeft) || 0) + (parseFloat(textStyle.paddingRight) || 0);
+    const availableWidth = Math.max(textarea.clientWidth - horizontalPadding, 240);
+    const separatorLength = Math.max(24, Math.floor(availableWidth / approxCharWidth));
+    const separator = '-'.repeat(separatorLength);
+    const start = textarea.selectionStart ?? textarea.value.length;
+    const end = textarea.selectionEnd ?? textarea.value.length;
+    const before = textarea.value.slice(0, start);
+    const after = textarea.value.slice(end);
+    const prefix = before && !before.endsWith('\n') ? '\n\n' : (before ? '\n' : '');
+    const suffix = after && !after.startsWith('\n') ? '\n\n' : '\n';
+    const insertText = `${prefix}${separator}${suffix}`;
+
+    textarea.value = `${before}${insertText}${after}`;
+    const nextPosition = before.length + insertText.length;
+    textarea.focus();
+    textarea.setSelectionRange(nextPosition, nextPosition);
+};
+
+window.insertDetailCheckmark = function() {
+    const textarea = document.getElementById('task-desc');
+    if (!textarea) return;
+
+    const checkmark = `${DETAIL_CHECK_MARK} `;
+    const start = textarea.selectionStart ?? textarea.value.length;
+    const end = textarea.selectionEnd ?? textarea.value.length;
+    const before = textarea.value.slice(0, start);
+    const after = textarea.value.slice(end);
+
+    textarea.value = `${before}${checkmark}${after}`;
+    const nextPosition = before.length + checkmark.length;
+    textarea.focus();
+    textarea.setSelectionRange(nextPosition, nextPosition);
+};
+
+window.insertDetailTimestamp = function() {
+    const textarea = document.getElementById('task-desc');
+    if (!textarea) return;
+
+    const timestamp = formatDetailTimestamp();
+    const start = textarea.selectionStart ?? textarea.value.length;
+    const value = textarea.value;
+    const lineStart = value.lastIndexOf('\n', Math.max(0, start - 1)) + 1;
+    const nextBreak = value.indexOf('\n', start);
+    const lineEnd = nextBreak === -1 ? value.length : nextBreak;
+    const lineText = value.slice(lineStart, lineEnd);
+    const replacementLine = buildRightAlignedTimestampLine(textarea, lineText, timestamp);
+
+    textarea.value = `${value.slice(0, lineStart)}${replacementLine}${value.slice(lineEnd)}`;
+    const nextPosition = lineStart + replacementLine.length;
+    textarea.focus();
+    textarea.setSelectionRange(nextPosition, nextPosition);
+};
+
+window.insertDetailTemplate = function() {
+    const textarea = document.getElementById('task-desc');
+    if (!textarea) return;
+
+    const template = [
+        '【作業前】',
+        '・確認すること：',
+        '・準備物：',
+        '',
+        '【作業中】',
+        '・進捗：',
+        '・気づき：',
+        '',
+        '【完了】',
+        '・完了内容：',
+        '・次回確認：'
+    ].join('\n');
+    const start = textarea.selectionStart ?? textarea.value.length;
+    const end = textarea.selectionEnd ?? textarea.value.length;
+    const before = textarea.value.slice(0, start);
+    const after = textarea.value.slice(end);
+    const prefix = before && !before.endsWith('\n') ? '\n\n' : '';
+    const suffix = after && !after.startsWith('\n') ? '\n\n' : '';
+    const insertText = `${prefix}${template}${suffix}`;
+
+    textarea.value = `${before}${insertText}${after}`;
+    const nextPosition = before.length + insertText.length;
+    textarea.focus();
+    textarea.setSelectionRange(nextPosition, nextPosition);
+};
+
+function getTaskDetailPreviewElement() {
+    let preview = document.getElementById('task-detail-preview');
+    if (!preview) {
+        preview = document.createElement('div');
+        preview.id = 'task-detail-preview';
+        preview.className = 'task-detail-preview';
+        document.body.appendChild(preview);
+    }
+    return preview;
+}
+
+window.showTaskDetailPreview = function(event, taskId) {
+    if (event) event.stopPropagation();
+    const task = tasks.find(t => t.id === taskId);
+    if (!task) return;
+
+    const title = task.title || task.content || '無題';
+    const detail = task.description || '';
+    const latestEdit = Array.isArray(task.editHistory) && task.editHistory.length ? task.editHistory[0] : '';
+    const preview = getTaskDetailPreviewElement();
+    preview.dataset.taskId = taskId;
+    preview.innerHTML = `
+        <button type="button" class="task-detail-preview-close" onclick="hideTaskDetailPreview()">×</button>
+        <div class="task-detail-preview-title" onpointerdown="startTaskDetailPreviewDrag(event)">${escapeHTML(title)}</div>
+        <div class="task-detail-preview-toolbar">
+            <input type="search" class="task-detail-preview-search" placeholder="詳細内を検索" oninput="filterTaskDetailPreview(this)">
+            ${latestEdit ? `<span class="task-detail-preview-history">最終: ${escapeHTML(latestEdit)}</span>` : ''}
+            <button type="button" class="task-detail-preview-filter" onclick="toggleHideDoneLines()">完了行を隠す</button>
+            <button type="button" class="task-detail-preview-edit" onclick="editTaskFromPreview()">編集</button>
+        </div>
+        <div class="task-detail-preview-body" onscroll="saveTaskDetailPreviewScroll(this)">${renderVisibleTaskDetailHTML(detail)}</div>
+    `;
+    preview.classList.add('active');
+    resetTaskDetailPreviewPosition(preview);
+    const body = preview.querySelector('.task-detail-preview-body');
+    const savedScroll = Number(localStorage.getItem(`detail-preview-scroll-${taskId}`) || 0);
+    if (body && savedScroll > 0) {
+        requestAnimationFrame(() => {
+            body.scrollTop = savedScroll;
+        });
+    }
+};
+
+window.hideTaskDetailPreview = function() {
+    const preview = document.getElementById('task-detail-preview');
+    if (preview) preview.classList.remove('active');
+};
+
+window.saveTaskDetailPreviewScroll = function(body) {
+    const preview = document.getElementById('task-detail-preview');
+    const taskId = preview && preview.dataset.taskId;
+    if (!taskId) return;
+    localStorage.setItem(`detail-preview-scroll-${taskId}`, String(body.scrollTop));
+};
+
+function resetTaskDetailPreviewPosition(preview) {
+    if (!preview || preview.dataset.dragMoved === 'true') return;
+    preview.style.left = '50%';
+    preview.style.top = '50%';
+    preview.style.transform = 'translate(-50%, -50%)';
+}
+
+window.startTaskDetailPreviewDrag = function(event) {
+    const preview = document.getElementById('task-detail-preview');
+    if (!preview || !preview.classList.contains('active')) return;
+    if (event.target.closest && event.target.closest('button, input')) return;
+
+    event.preventDefault();
+    const rect = preview.getBoundingClientRect();
+    const offsetX = event.clientX - rect.left;
+    const offsetY = event.clientY - rect.top;
+    preview.dataset.dragMoved = 'true';
+    preview.classList.add('dragging');
+    preview.style.transform = 'none';
+    preview.setPointerCapture(event.pointerId);
+
+    const movePreview = moveEvent => {
+        const maxLeft = window.innerWidth - rect.width - 12;
+        const maxTop = window.innerHeight - rect.height - 12;
+        const nextLeft = Math.min(Math.max(12, moveEvent.clientX - offsetX), Math.max(12, maxLeft));
+        const nextTop = Math.min(Math.max(12, moveEvent.clientY - offsetY), Math.max(12, maxTop));
+        preview.style.left = `${nextLeft}px`;
+        preview.style.top = `${nextTop}px`;
+    };
+
+    const stopDrag = () => {
+        preview.classList.remove('dragging');
+        preview.removeEventListener('pointermove', movePreview);
+        preview.removeEventListener('pointerup', stopDrag);
+        preview.removeEventListener('pointercancel', stopDrag);
+        try {
+            preview.releasePointerCapture(event.pointerId);
+        } catch (e) {}
+    };
+
+    preview.addEventListener('pointermove', movePreview);
+    preview.addEventListener('pointerup', stopDrag);
+    preview.addEventListener('pointercancel', stopDrag);
+};
+
+function persistTaskUpdate(task) {
+    upsertTaskLocally(task);
+
+    if (db) {
+        db.ref('tasks/' + task.id).set(task).catch(console.warn);
+    }
+}
+
+window.toggleDetailLineCheck = function(event, lineIndex) {
+    if (event) event.stopPropagation();
+    const preview = document.getElementById('task-detail-preview');
+    const taskId = preview && preview.dataset.taskId;
+    const task = taskId ? tasks.find(t => t.id === taskId) : null;
+    if (!task) return;
+
+    const lines = (task.description || '').split(/\r?\n/);
+    if (lineIndex < 0 || lineIndex >= lines.length) return;
+
+    if (lines[lineIndex].includes(DETAIL_CHECK_MARK)) {
+        lines[lineIndex] = lines[lineIndex].replace(`${DETAIL_CHECK_MARK} `, '').replace(DETAIL_CHECK_MARK, '').trimStart();
+    } else {
+        lines[lineIndex] = `${DETAIL_CHECK_MARK} ${lines[lineIndex]}`;
+    }
+
+    task.description = lines.join('\n');
+    task.updatedAt = new Date().toISOString();
+    persistTaskUpdate(task);
+    renderTasks();
+
+    const search = preview.querySelector('.task-detail-preview-search');
+    const body = preview.querySelector('.task-detail-preview-body');
+    if (body) {
+        body.innerHTML = renderVisibleTaskDetailHTML(task.description || '', search ? search.value.trim() : '', preview.dataset.hideDone === 'true');
+    }
+};
+
+window.filterTaskDetailPreview = function(input) {
+    const preview = document.getElementById('task-detail-preview');
+    const taskId = preview && preview.dataset.taskId;
+    const body = preview && preview.querySelector('.task-detail-preview-body');
+    const task = taskId ? tasks.find(t => t.id === taskId) : null;
+    if (!body || !task) return;
+    body.innerHTML = renderVisibleTaskDetailHTML(task.description || '', input.value.trim(), preview.dataset.hideDone === 'true');
+};
+
+window.toggleHideDoneLines = function() {
+    const preview = document.getElementById('task-detail-preview');
+    if (!preview) return;
+    const hideDone = preview.dataset.hideDone !== 'true';
+    preview.dataset.hideDone = hideDone ? 'true' : 'false';
+    const button = preview.querySelector('.task-detail-preview-filter');
+    const search = preview.querySelector('.task-detail-preview-search');
+    const body = preview.querySelector('.task-detail-preview-body');
+    const task = preview.dataset.taskId ? tasks.find(t => t.id === preview.dataset.taskId) : null;
+    if (button) button.textContent = hideDone ? '完了行も表示' : '完了行を隠す';
+    if (button) button.classList.toggle('active', hideDone);
+    if (body && task) {
+        body.innerHTML = renderVisibleTaskDetailHTML(task.description || '', search ? search.value.trim() : '', hideDone);
+    }
+};
+
+window.editTaskFromPreview = function() {
+    const preview = document.getElementById('task-detail-preview');
+    const taskId = preview && preview.dataset.taskId;
+    const task = taskId ? tasks.find(t => t.id === taskId) : null;
+    if (!task) return;
+    hideTaskDetailPreview();
+    openModal(task.status, task.id);
+};
+
+document.addEventListener('click', function(event) {
+    const preview = document.getElementById('task-detail-preview');
+    if (!preview || !preview.classList.contains('active')) return;
+    if (preview.contains(event.target)) return;
+    if (event.target.closest && event.target.closest('.detail-preview-trigger')) return;
+    hideTaskDetailPreview();
+});
+
 window.closeModal = function() {
+    saveDraftNow();
     document.getElementById('modal-overlay').classList.remove('active');
 };
 
@@ -784,11 +1343,8 @@ window.archiveTask = function(e, id) {
         const task = tasks.find(t => t.id === id);
         if (!task) return;
         task.status = 'archived';
-
-        let localTasks = JSON.parse(localStorage.getItem('local_tasks') || '[]');
-        const idx = localTasks.findIndex(t => t.id === id);
-        if (idx >= 0) localTasks[idx] = task;
-        localStorage.setItem('local_tasks', JSON.stringify(localTasks));
+        task.updatedAt = new Date().toISOString();
+        upsertTaskLocally(task);
 
         renderTasks();
 
